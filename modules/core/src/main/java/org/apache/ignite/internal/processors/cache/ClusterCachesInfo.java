@@ -31,7 +31,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -63,6 +62,7 @@ import org.apache.ignite.internal.processors.query.QuerySchema;
 import org.apache.ignite.internal.processors.query.QuerySchemaPatch;
 import org.apache.ignite.internal.processors.query.QueryUtils;
 import org.apache.ignite.internal.util.lang.GridFunc;
+import org.apache.ignite.internal.util.lang.GridPlainCallable;
 import org.apache.ignite.internal.util.typedef.F;
 import org.apache.ignite.internal.util.typedef.T2;
 import org.apache.ignite.internal.util.typedef.internal.CU;
@@ -640,8 +640,8 @@ public class ClusterCachesInfo {
         }
 
         if (!F.isEmpty(reqsToComplete)) {
-            ctx.closure().callLocalSafe(new Callable<Void>() {
-                @Override public Void call() throws Exception {
+            ctx.closure().callLocalSafe(new GridPlainCallable<Void>() {
+                @Override public Void call() {
                     for (T2<DynamicCacheChangeRequest, AffinityTopologyVersion> t : reqsToComplete) {
                         final DynamicCacheChangeRequest req = t.get1();
                         AffinityTopologyVersion waitTopVer = t.get2();
@@ -1864,9 +1864,10 @@ public class ClusterCachesInfo {
 
     /**
      * @param data Joining node data.
+     * @param joiningNodeClient Joining node is client flag.
      * @return Message with error or null if everything was OK.
      */
-    public String validateJoiningNodeData(DiscoveryDataBag.JoiningNodeDiscoveryData data) {
+    public String validateJoiningNodeData(DiscoveryDataBag.JoiningNodeDiscoveryData data, boolean joiningNodeClient) {
         if (data.hasJoiningNodeData()) {
             Serializable joiningNodeData = data.joiningNodeData();
 
@@ -1874,6 +1875,7 @@ public class ClusterCachesInfo {
                 CacheJoinNodeDiscoveryData joinData = (CacheJoinNodeDiscoveryData)joiningNodeData;
 
                 Set<String> problemCaches = null;
+                Set<String> encClientCaches = null;
 
                 for (CacheJoinNodeDiscoveryData.CacheInfo cacheInfo : joinData.caches().values()) {
                     CacheConfiguration<?, ?> cfg = cacheInfo.cacheData().config();
@@ -1895,6 +1897,12 @@ public class ClusterCachesInfo {
 
                             problemCaches.add(cfg.getName());
                         }
+                        else if (joiningNodeClient && cfg.isEncryptionEnabled()) {
+                            if (encClientCaches == null)
+                                encClientCaches = new HashSet<>();
+
+                            encClientCaches.add(cfg.getName());
+                        }
                     }
                 }
 
@@ -1903,6 +1911,14 @@ public class ClusterCachesInfo {
                         "Joining node has caches with data which are not presented on cluster, " +
                             "it could mean that they were already destroyed, to add the node to cluster - " +
                             "remove directories with the caches[", "]"));
+
+                if (!F.isEmpty(encClientCaches)) {
+                    return encClientCaches.stream().collect(Collectors.joining(", ",
+                        "Joining node has encrypted caches which are not presented on the cluster, " +
+                            "encrypted caches configured on client node cannot be started when such node joins " +
+                            "the cluster, these caches can be started manually (dynamically) after node joined" +
+                            "[caches=", "]"));
+                }
             }
         }
 
@@ -2194,6 +2210,7 @@ public class ClusterCachesInfo {
      * @param rcvdFrom Node ID cache was recived from.
      * @param deploymentId Deployment ID.
      * @param encKey Encryption key.
+     * @param cacheCfgEnrichment Cache configuration enrichment.
      * @return Group descriptor.
      */
     private CacheGroupDescriptor registerCacheGroup(
@@ -2221,6 +2238,13 @@ public class ClusterCachesInfo {
         Map<String, Integer> caches = Collections.singletonMap(startedCacheCfg.getName(), cacheId);
 
         boolean persistent = resolvePersistentFlag(exchActions, startedCacheCfg);
+        boolean walGloballyEnabled = false;
+
+        // client nodes cannot read wal enabled/disabled status so they should use default one
+        if (ctx.clientNode())
+            walGloballyEnabled = persistent;
+        else if (persistent)
+            walGloballyEnabled = ctx.cache().context().database().walEnabled(grpId, false);
 
         CacheGroupDescriptor grpDesc = new CacheGroupDescriptor(
             startedCacheCfg,
@@ -2231,16 +2255,13 @@ public class ClusterCachesInfo {
             deploymentId,
             caches,
             persistent,
-            persistent,
+            walGloballyEnabled,
             null,
             cacheCfgEnrichment
         );
 
         if (startedCacheCfg.isEncryptionEnabled())
-            ctx.encryption().beforeCacheGroupStart(grpId, encKey);
-
-        if (ctx.cache().context().pageStore() != null)
-            ctx.cache().context().pageStore().beforeCacheGroupStart(grpDesc);
+            ctx.encryption().setInitialGroupKey(grpId, encKey);
 
         CacheGroupDescriptor old = registeredCacheGrps.put(grpId, grpDesc);
 
